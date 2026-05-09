@@ -4,11 +4,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum Error {
     Io { path: PathBuf, source: io::Error },
     CapnpFailed { command: String, stderr: String },
+    CommandFailed { command: String, stderr: String },
     NoSchemas(PathBuf),
     Usage(String),
 }
@@ -18,6 +20,13 @@ impl fmt::Display for Error {
         match self {
             Error::Io { path, source } => write!(f, "{}: {}", path.display(), source),
             Error::CapnpFailed { command, stderr } => {
+                write!(f, "`{command}` failed")?;
+                if !stderr.trim().is_empty() {
+                    write!(f, "\n{}", stderr.trim())?;
+                }
+                Ok(())
+            }
+            Error::CommandFailed { command, stderr } => {
                 write!(f, "`{command}` failed")?;
                 if !stderr.trim().is_empty() {
                     write!(f, "\n{}", stderr.trim())?;
@@ -36,7 +45,19 @@ impl std::error::Error for Error {}
 pub struct CheckConfig {
     pub before: Vec<String>,
     pub after: Vec<String>,
+    pub before_ref: Option<String>,
+    pub after_ref: Option<String>,
+    pub compare_ref: Option<String>,
+    pub paths: Vec<String>,
     pub import_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCheck {
+    before: Vec<String>,
+    after: Vec<String>,
+    before_import_paths: Vec<PathBuf>,
+    after_import_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,24 +117,149 @@ pub struct Method {
 }
 
 pub fn check(config: &CheckConfig) -> Result<Report, Error> {
+    match check_mode(config)? {
+        CheckMode::Filesystem(resolved) => check_resolved(&resolved),
+        CheckMode::GitRefs {
+            before_ref,
+            after_ref,
+            paths,
+            import_paths,
+        } => {
+            let export = GitExport::new(&before_ref, &after_ref)?;
+            let resolved = ResolvedCheck {
+                before: prefix_sources(&export.before_dir, &paths),
+                after: prefix_sources(&export.after_dir, &paths),
+                before_import_paths: prefix_import_paths(&export.before_dir, &import_paths),
+                after_import_paths: prefix_import_paths(&export.after_dir, &import_paths),
+            };
+            check_resolved(&resolved)
+        }
+        CheckMode::CompareRef {
+            compare_ref,
+            paths,
+            import_paths,
+        } => {
+            let export = WorktreeExport::new(&compare_ref)?;
+            let resolved = ResolvedCheck {
+                before: prefix_sources(&export.before_dir, &paths),
+                after: prefix_sources(&export.after_dir, &paths),
+                before_import_paths: prefix_import_paths(&export.before_dir, &import_paths),
+                after_import_paths: prefix_import_paths(&export.after_dir, &import_paths),
+            };
+            check_resolved(&resolved)
+        }
+    }
+}
+
+enum CheckMode {
+    Filesystem(ResolvedCheck),
+    GitRefs {
+        before_ref: String,
+        after_ref: String,
+        paths: Vec<String>,
+        import_paths: Vec<PathBuf>,
+    },
+    CompareRef {
+        compare_ref: String,
+        paths: Vec<String>,
+        import_paths: Vec<PathBuf>,
+    },
+}
+
+fn check_resolved(config: &ResolvedCheck) -> Result<Report, Error> {
     let before_sources = discover_capnp_sources(&config.before)?;
     let after_sources = discover_capnp_sources(&config.after)?;
 
     compile_with_capnp(
         &before_sources.files,
         &before_sources.import_roots,
-        &config.import_paths,
+        &config.before_import_paths,
     )?;
     compile_with_capnp(
         &after_sources.files,
         &after_sources.import_roots,
-        &config.import_paths,
+        &config.after_import_paths,
     )?;
 
     let before = snapshot_files(&before_sources.files)?;
     let after = snapshot_files(&after_sources.files)?;
 
     Ok(compare(&before, &after))
+}
+
+fn check_mode(config: &CheckConfig) -> Result<CheckMode, Error> {
+    let filesystem_mode = !config.before.is_empty() || !config.after.is_empty();
+    let ref_to_ref_mode = config.before_ref.is_some() || config.after_ref.is_some();
+    let compare_ref_mode = config.compare_ref.is_some();
+
+    if filesystem_mode && (ref_to_ref_mode || compare_ref_mode || !config.paths.is_empty()) {
+        return Err(Error::Usage(format!(
+            "cannot mix --before/--after with ref comparison flags\n\n{}",
+            usage()
+        )));
+    }
+
+    if ref_to_ref_mode && compare_ref_mode {
+        return Err(Error::Usage(format!(
+            "cannot mix --compare-ref with --before-ref/--after-ref\n\n{}",
+            usage()
+        )));
+    }
+
+    if ref_to_ref_mode {
+        let before_ref = config
+            .before_ref
+            .clone()
+            .ok_or_else(|| Error::Usage(format!("missing --before-ref\n\n{}", usage())))?;
+        let after_ref = config
+            .after_ref
+            .clone()
+            .ok_or_else(|| Error::Usage(format!("missing --after-ref\n\n{}", usage())))?;
+        if config.paths.is_empty() {
+            return Err(Error::Usage(format!("missing --path\n\n{}", usage())));
+        }
+        return Ok(CheckMode::GitRefs {
+            before_ref,
+            after_ref,
+            paths: config.paths.clone(),
+            import_paths: config.import_paths.clone(),
+        });
+    }
+
+    if compare_ref_mode {
+        if config.paths.is_empty() {
+            return Err(Error::Usage(format!("missing --path\n\n{}", usage())));
+        }
+        return Ok(CheckMode::CompareRef {
+            compare_ref: config
+                .compare_ref
+                .clone()
+                .expect("compare ref checked above"),
+            paths: config.paths.clone(),
+            import_paths: config.import_paths.clone(),
+        });
+    }
+
+    if !config.paths.is_empty() {
+        return Err(Error::Usage(format!(
+            "--path requires --before-ref/--after-ref or --compare-ref\n\n{}",
+            usage()
+        )));
+    }
+
+    if config.before.is_empty() {
+        return Err(Error::Usage(format!("missing --before\n\n{}", usage())));
+    }
+    if config.after.is_empty() {
+        return Err(Error::Usage(format!("missing --after\n\n{}", usage())));
+    }
+
+    Ok(CheckMode::Filesystem(ResolvedCheck {
+        before: config.before.clone(),
+        after: config.after.clone(),
+        before_import_paths: config.import_paths.clone(),
+        after_import_paths: config.import_paths.clone(),
+    }))
 }
 
 pub fn compare(before: &Snapshot, after: &Snapshot) -> Report {
@@ -459,6 +605,226 @@ fn glob_component_match_inner(pattern: &[char], candidate: &[char]) -> bool {
     }
 }
 
+struct GitExport {
+    root: PathBuf,
+    before_dir: PathBuf,
+    after_dir: PathBuf,
+}
+
+impl GitExport {
+    fn new(before_ref: &str, after_ref: &str) -> Result<Self, Error> {
+        let root = make_temp_dir()?;
+        let before_dir = root.join("before");
+        let after_dir = root.join("after");
+        fs::create_dir_all(&before_dir).map_err(|source| Error::Io {
+            path: before_dir.clone(),
+            source,
+        })?;
+        fs::create_dir_all(&after_dir).map_err(|source| Error::Io {
+            path: after_dir.clone(),
+            source,
+        })?;
+
+        export_git_ref(before_ref, &before_dir)?;
+        export_git_ref(after_ref, &after_dir)?;
+
+        Ok(Self {
+            root,
+            before_dir,
+            after_dir,
+        })
+    }
+}
+
+impl Drop for GitExport {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+struct WorktreeExport {
+    root: PathBuf,
+    before_dir: PathBuf,
+    after_dir: PathBuf,
+}
+
+impl WorktreeExport {
+    fn new(compare_ref: &str) -> Result<Self, Error> {
+        let root = make_temp_dir()?;
+        let before_dir = root.join("before");
+        let after_dir = root.join("after");
+        fs::create_dir_all(&before_dir).map_err(|source| Error::Io {
+            path: before_dir.clone(),
+            source,
+        })?;
+        fs::create_dir_all(&after_dir).map_err(|source| Error::Io {
+            path: after_dir.clone(),
+            source,
+        })?;
+
+        export_git_ref(compare_ref, &before_dir)?;
+        let repo_root = git_repo_root()?;
+        copy_worktree(&repo_root, &after_dir)?;
+
+        Ok(Self {
+            root,
+            before_dir,
+            after_dir,
+        })
+    }
+}
+
+impl Drop for WorktreeExport {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn make_temp_dir() -> Result<PathBuf, Error> {
+    let mut root = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    root.push(format!("captain-git-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&root).map_err(|source| Error::Io {
+        path: root.clone(),
+        source,
+    })?;
+    Ok(root)
+}
+
+fn git_repo_root() -> Result<PathBuf, Error> {
+    let mut command = Command::new("git");
+    command.arg("rev-parse").arg("--show-toplevel");
+    let printable = format!("{command:?}");
+    let output = command.output().map_err(|source| Error::Io {
+        path: PathBuf::from("git"),
+        source,
+    })?;
+
+    if !output.status.success() {
+        return Err(Error::CommandFailed {
+            command: printable,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
+}
+
+fn export_git_ref(reference: &str, destination: &Path) -> Result<(), Error> {
+    let archive = destination.with_extension("tar");
+
+    let mut archive_command = Command::new("git");
+    archive_command
+        .arg("archive")
+        .arg("--format=tar")
+        .arg(format!("--output={}", archive.display()))
+        .arg(reference);
+    run_command(archive_command)?;
+
+    let mut tar_command = Command::new("tar");
+    tar_command
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(destination);
+    let result = run_command(tar_command);
+    let _ = fs::remove_file(&archive);
+    result
+}
+
+fn run_command(mut command: Command) -> Result<(), Error> {
+    let printable = format!("{command:?}");
+    let output = command.output().map_err(|source| Error::Io {
+        path: command.get_program().into(),
+        source,
+    })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::CommandFailed {
+            command: printable,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+fn copy_worktree(source: &Path, destination: &Path) -> Result<(), Error> {
+    for entry in fs::read_dir(source).map_err(|source_error| Error::Io {
+        path: source.to_owned(),
+        source: source_error,
+    })? {
+        let entry = entry.map_err(|source_error| Error::Io {
+            path: source.to_owned(),
+            source: source_error,
+        })?;
+        let file_name = entry.file_name();
+        if should_skip_worktree_entry(&file_name.to_string_lossy()) {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination_path = destination.join(&file_name);
+        let metadata = entry.metadata().map_err(|source_error| Error::Io {
+            path: source_path.clone(),
+            source: source_error,
+        })?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(|source_error| Error::Io {
+                path: destination_path.clone(),
+                source: source_error,
+            })?;
+            copy_worktree(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|source_error| Error::Io {
+                path: source_path,
+                source: source_error,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_worktree_entry(name: &str) -> bool {
+    matches!(name, ".git" | "target")
+}
+
+fn prefix_sources(root: &Path, sources: &[String]) -> Vec<String> {
+    sources
+        .iter()
+        .map(|source| prefix_string_path(root, source))
+        .collect()
+}
+
+fn prefix_import_paths(root: &Path, import_paths: &[PathBuf]) -> Vec<PathBuf> {
+    import_paths
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        })
+        .collect()
+}
+
+fn prefix_string_path(root: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.display().to_string()
+    } else {
+        root.join(path).display().to_string()
+    }
+}
+
 fn compare_struct_fields(
     node_name: &str,
     before_node: &Node,
@@ -754,12 +1120,20 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CheckConfig,
 
     let mut before = None;
     let mut after = None;
+    let mut before_ref = None;
+    let mut after_ref = None;
+    let mut compare_ref = None;
+    let mut paths = None;
     let mut import_paths = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--before" => push_sources(&mut before, &mut args, "--before")?,
             "--after" => push_sources(&mut after, &mut args, "--after")?,
+            "--before-ref" => before_ref = Some(take_value(&mut args, "--before-ref")?),
+            "--after-ref" => after_ref = Some(take_value(&mut args, "--after-ref")?),
+            "--compare-ref" => compare_ref = Some(take_value(&mut args, "--compare-ref")?),
+            "--path" => push_sources(&mut paths, &mut args, "--path")?,
             "-I" | "--import-path" => {
                 let Some(path) = args.next() else {
                     return Err(Error::Usage(format!(
@@ -781,18 +1155,44 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CheckConfig,
         }
     }
 
-    let before = before.ok_or_else(|| Error::Usage(format!("missing --before\n\n{}", usage())))?;
-    let after = after.ok_or_else(|| Error::Usage(format!("missing --after\n\n{}", usage())))?;
-
     Ok(CheckConfig {
-        before,
-        after,
+        before: before.unwrap_or_default(),
+        after: after.unwrap_or_default(),
+        before_ref,
+        after_ref,
+        compare_ref,
+        paths: paths.unwrap_or_default(),
         import_paths,
     })
 }
 
 pub fn usage() -> String {
-    "usage: captain check --before <path|glob>... --after <path|glob>... [-I <path>]...".to_owned()
+    concat!(
+        "usage:\n",
+        "  captain check --before <path|glob>... --after <path|glob>... [-I <path>]...\n",
+        "  captain check --before-ref <ref> --after-ref <ref> --path <path|glob>... [-I <path>]...\n",
+        "  captain check --compare-ref <ref> --path <path|glob>... [-I <path>]..."
+    )
+    .to_owned()
+}
+
+fn take_value(
+    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    flag: &str,
+) -> Result<String, Error> {
+    let Some(value) = args.next() else {
+        return Err(Error::Usage(format!(
+            "{flag} requires a value\n\n{}",
+            usage()
+        )));
+    };
+    if value.starts_with('-') {
+        return Err(Error::Usage(format!(
+            "{flag} requires a value\n\n{}",
+            usage()
+        )));
+    }
+    Ok(value)
 }
 
 fn push_sources(
