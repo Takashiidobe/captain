@@ -1,0 +1,11 @@
+---
+source: tests/fixtures.rs
+expression: render_output(&output)
+---
+status: 1
+stdout:
+incompatible: Status
+  reason: node kind changed
+  before: Struct
+  after: Enum
+stderr:

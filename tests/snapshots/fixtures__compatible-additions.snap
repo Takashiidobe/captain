@@ -1,0 +1,8 @@
+---
+source: tests/fixtures.rs
+expression: render_output(&output)
+---
+status: 0
+stdout:
+compatible: no backwards-incompatible schema changes found
+stderr:

@@ -1,0 +1,11 @@
+---
+source: tests/fixtures.rs
+expression: render_output(&output)
+---
+status: 1
+stdout:
+incompatible: Status.enum[1]
+  reason: enum ordinal was reused with a different name
+  before: disabled
+  after: deleted
+stderr:

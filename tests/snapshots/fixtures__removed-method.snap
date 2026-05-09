@@ -1,0 +1,10 @@
+---
+source: tests/fixtures.rs
+expression: render_output(&output)
+---
+status: 1
+stdout:
+incompatible: Users.method[1]
+  reason: method was removed
+  before: list () -> (count :UInt32)
+stderr:
