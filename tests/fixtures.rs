@@ -76,6 +76,80 @@ fn git_refs_compare_same_path() {
 }
 
 #[test]
+fn git_refs_materialize_import_paths() {
+    let repo = temp_dir("captain-git-ref-imports");
+    fs::create_dir_all(repo.join("api")).unwrap();
+    fs::create_dir_all(repo.join("schemas")).unwrap();
+    git(&repo, ["init", "-q"]);
+    git(&repo, ["config", "user.email", "captain@example.com"]);
+    git(&repo, ["config", "user.name", "Captain Tests"]);
+
+    fs::write(
+        repo.join("schemas/common.capnp"),
+        concat!(
+            "@0x839d3a54ab796b36;\n",
+            "\n",
+            "struct Email {\n",
+            "  value @0 :Text;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("api/user.capnp"),
+        concat!(
+            "@0xdbb9ad1f14bf0b36;\n",
+            "\n",
+            "using Common = import \"/common.capnp\";\n",
+            "\n",
+            "struct User {\n",
+            "  email @0 :Common.Email;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    git(&repo, ["add", "api/user.capnp", "schemas/common.capnp"]);
+    git(&repo, ["commit", "-q", "-m", "old schema"]);
+
+    fs::write(
+        repo.join("api/user.capnp"),
+        concat!(
+            "@0xdbb9ad1f14bf0b36;\n",
+            "\n",
+            "using Common = import \"/common.capnp\";\n",
+            "\n",
+            "struct User {\n",
+            "  email @0 :Common.Email;\n",
+            "  name @1 :Text;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    git(&repo, ["add", "api/user.capnp"]);
+    git(&repo, ["commit", "-q", "-m", "new schema"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_captain"))
+        .current_dir(&repo)
+        .args([
+            "check",
+            "--before-ref",
+            "HEAD~1",
+            "--after-ref",
+            "HEAD",
+            "--path",
+            "api/**/*.capnp",
+            "-I",
+            "schemas",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", render_output(&output),);
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn compare_ref_uses_current_worktree() {
     let repo = temp_dir("captain-compare-ref");
     fs::create_dir_all(repo.join("schemas")).unwrap();
@@ -124,6 +198,76 @@ fn compare_ref_uses_current_worktree() {
         .unwrap();
 
     insta::assert_snapshot!("compare-ref-worktree", render_output(&output));
+
+    fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn compare_ref_materializes_import_paths() {
+    let repo = temp_dir("captain-compare-ref-imports");
+    fs::create_dir_all(repo.join("api")).unwrap();
+    fs::create_dir_all(repo.join("schemas")).unwrap();
+    git(&repo, ["init", "-q"]);
+    git(&repo, ["config", "user.email", "captain@example.com"]);
+    git(&repo, ["config", "user.name", "Captain Tests"]);
+
+    fs::write(
+        repo.join("schemas/common.capnp"),
+        concat!(
+            "@0x839d3a54ab796b36;\n",
+            "\n",
+            "struct Email {\n",
+            "  value @0 :Text;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("api/user.capnp"),
+        concat!(
+            "@0xdbb9ad1f14bf0b36;\n",
+            "\n",
+            "using Common = import \"/common.capnp\";\n",
+            "\n",
+            "struct User {\n",
+            "  email @0 :Common.Email;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    git(&repo, ["add", "api/user.capnp", "schemas/common.capnp"]);
+    git(&repo, ["commit", "-q", "-m", "baseline schema"]);
+
+    fs::write(
+        repo.join("api/user.capnp"),
+        concat!(
+            "@0xdbb9ad1f14bf0b36;\n",
+            "\n",
+            "using Common = import \"/common.capnp\";\n",
+            "\n",
+            "struct User {\n",
+            "  email @0 :Common.Email;\n",
+            "  name @1 :Text;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_captain"))
+        .current_dir(&repo)
+        .args([
+            "check",
+            "--compare-ref",
+            "HEAD",
+            "--path",
+            "api/**/*.capnp",
+            "-I",
+            "schemas",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", render_output(&output),);
 
     fs::remove_dir_all(repo).unwrap();
 }

@@ -125,7 +125,7 @@ pub fn check(config: &CheckConfig) -> Result<Report, Error> {
             paths,
             import_paths,
         } => {
-            let export = GitExport::new(&before_ref, &after_ref)?;
+            let export = GitExport::new(&before_ref, &after_ref, &paths, &import_paths)?;
             let resolved = ResolvedCheck {
                 before: prefix_sources(&export.before_dir, &paths),
                 after: prefix_sources(&export.after_dir, &paths),
@@ -139,7 +139,7 @@ pub fn check(config: &CheckConfig) -> Result<Report, Error> {
             paths,
             import_paths,
         } => {
-            let export = WorktreeExport::new(&compare_ref)?;
+            let export = WorktreeExport::new(&compare_ref, &paths, &import_paths)?;
             let resolved = ResolvedCheck {
                 before: prefix_sources(&export.before_dir, &paths),
                 after: prefix_sources(&export.after_dir, &paths),
@@ -612,7 +612,12 @@ struct GitExport {
 }
 
 impl GitExport {
-    fn new(before_ref: &str, after_ref: &str) -> Result<Self, Error> {
+    fn new(
+        before_ref: &str,
+        after_ref: &str,
+        paths: &[String],
+        import_paths: &[PathBuf],
+    ) -> Result<Self, Error> {
         let root = make_temp_dir()?;
         let before_dir = root.join("before");
         let after_dir = root.join("after");
@@ -625,8 +630,9 @@ impl GitExport {
             source,
         })?;
 
-        export_git_ref(before_ref, &before_dir)?;
-        export_git_ref(after_ref, &after_dir)?;
+        let archive_roots = archive_roots(paths, import_paths);
+        export_git_ref(before_ref, &before_dir, &archive_roots)?;
+        export_git_ref(after_ref, &after_dir, &archive_roots)?;
 
         Ok(Self {
             root,
@@ -649,7 +655,7 @@ struct WorktreeExport {
 }
 
 impl WorktreeExport {
-    fn new(compare_ref: &str) -> Result<Self, Error> {
+    fn new(compare_ref: &str, paths: &[String], import_paths: &[PathBuf]) -> Result<Self, Error> {
         let root = make_temp_dir()?;
         let before_dir = root.join("before");
         let after_dir = root.join("after");
@@ -662,9 +668,10 @@ impl WorktreeExport {
             source,
         })?;
 
-        export_git_ref(compare_ref, &before_dir)?;
+        let archive_roots = archive_roots(paths, import_paths);
+        export_git_ref(compare_ref, &before_dir, &archive_roots)?;
         let repo_root = git_repo_root()?;
-        copy_worktree(&repo_root, &after_dir)?;
+        copy_worktree_paths(&repo_root, &after_dir, &archive_roots)?;
 
         Ok(Self {
             root,
@@ -715,8 +722,13 @@ fn git_repo_root() -> Result<PathBuf, Error> {
     ))
 }
 
-fn export_git_ref(reference: &str, destination: &Path) -> Result<(), Error> {
+fn export_git_ref(reference: &str, destination: &Path, paths: &[PathBuf]) -> Result<(), Error> {
     let archive = destination.with_extension("tar");
+    let existing_paths = existing_git_paths(reference, paths)?;
+
+    if !paths.is_empty() && existing_paths.is_empty() {
+        return Ok(());
+    }
 
     let mut archive_command = Command::new("git");
     archive_command
@@ -724,6 +736,10 @@ fn export_git_ref(reference: &str, destination: &Path) -> Result<(), Error> {
         .arg("--format=tar")
         .arg(format!("--output={}", archive.display()))
         .arg(reference);
+    if !existing_paths.is_empty() {
+        archive_command.arg("--");
+        archive_command.args(existing_paths);
+    }
     run_command(archive_command)?;
 
     let mut tar_command = Command::new("tar");
@@ -735,6 +751,52 @@ fn export_git_ref(reference: &str, destination: &Path) -> Result<(), Error> {
     let result = run_command(tar_command);
     let _ = fs::remove_file(&archive);
     result
+}
+
+fn existing_git_paths(reference: &str, paths: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    verify_git_tree(reference)?;
+
+    let mut existing = Vec::new();
+
+    for path in paths {
+        let Some(path) = git_relative_path(path) else {
+            continue;
+        };
+        if path == Path::new(".") {
+            existing.push(path);
+            continue;
+        }
+        let mut command = Command::new("git");
+        command
+            .arg("cat-file")
+            .arg("-e")
+            .arg(format!("{reference}:{}", path_to_slash(&path)));
+
+        let output = command.output().map_err(|source| Error::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+
+        if output.status.success() {
+            existing.push(path);
+        }
+    }
+
+    Ok(existing)
+}
+
+fn verify_git_tree(reference: &str) -> Result<(), Error> {
+    let mut command = Command::new("git");
+    command
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("{reference}^{{tree}}"));
+    run_command(command)
 }
 
 fn run_command(mut command: Command) -> Result<(), Error> {
@@ -792,8 +854,100 @@ fn copy_worktree(source: &Path, destination: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+fn copy_worktree_paths(source: &Path, destination: &Path, paths: &[PathBuf]) -> Result<(), Error> {
+    if paths.is_empty() {
+        return copy_worktree(source, destination);
+    }
+
+    for path in paths {
+        let Some(path) = git_relative_path(path) else {
+            continue;
+        };
+        let source_path = source.join(&path);
+        if !source_path.exists() {
+            continue;
+        }
+        let destination_path = destination.join(&path);
+        let metadata = fs::metadata(&source_path).map_err(|source_error| Error::Io {
+            path: source_path.clone(),
+            source: source_error,
+        })?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path).map_err(|source_error| Error::Io {
+                path: destination_path.clone(),
+                source: source_error,
+            })?;
+            copy_worktree(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).map_err(|source_error| Error::Io {
+                    path: parent.to_owned(),
+                    source: source_error,
+                })?;
+            }
+            fs::copy(&source_path, &destination_path).map_err(|source_error| Error::Io {
+                path: source_path,
+                source: source_error,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 fn should_skip_worktree_entry(name: &str) -> bool {
     matches!(name, ".git" | "target")
+}
+
+fn archive_roots(paths: &[String], import_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+
+    for path in paths {
+        roots.insert(materialization_root(path));
+    }
+
+    for path in import_paths {
+        if !path.is_absolute() {
+            roots.insert(path.clone());
+        }
+    }
+
+    roots
+        .into_iter()
+        .filter_map(|path| git_relative_path(&path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn materialization_root(path: &str) -> PathBuf {
+    if has_glob_meta(path) {
+        glob_base(path)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn git_relative_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            _ => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        Some(PathBuf::from("."))
+    } else {
+        Some(normalized)
+    }
 }
 
 fn prefix_sources(root: &Path, sources: &[String]) -> Vec<String> {
@@ -1227,4 +1381,43 @@ pub fn violation_paths(report: &Report) -> BTreeSet<String> {
         .iter()
         .map(|violation| violation.path.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_roots_use_glob_bases_and_relative_import_paths() {
+        let roots = archive_roots(
+            &["schemas/**/*.capnp".to_owned(), "api/user.capnp".to_owned()],
+            &[
+                PathBuf::from("schemas"),
+                PathBuf::from("shared/capnp"),
+                PathBuf::from("/usr/include/capnp"),
+            ],
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("api/user.capnp"),
+                PathBuf::from("schemas"),
+                PathBuf::from("shared/capnp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_roots_reject_parent_paths() {
+        let roots = archive_roots(
+            &[
+                "schemas/**/*.capnp".to_owned(),
+                "../outside/**/*.capnp".to_owned(),
+            ],
+            &[PathBuf::from("./schemas"), PathBuf::from("../shared")],
+        );
+
+        assert_eq!(roots, vec![PathBuf::from("schemas")]);
+    }
 }

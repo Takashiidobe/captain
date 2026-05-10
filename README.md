@@ -49,9 +49,10 @@ before = schemas/**/*.capnp from origin/main
 after  = schemas/**/*.capnp from HEAD
 ```
 
-Captain exports both refs into temporary directories with `git archive`, rewrites
-the path glob under each export, and runs the normal comparison. The working tree
-does not affect this mode.
+Captain exports the requested path roots and relative import paths from both refs
+into temporary directories with `git archive`, rewrites the path glob under each
+export, and runs the normal comparison. The working tree does not affect this
+mode.
 
 ### Git Ref To Current Worktree
 
@@ -72,9 +73,9 @@ after  = schemas/**/*.capnp from the current working tree
 ```
 
 The worktree side includes committed files, staged changes, unstaged changes, and
-untracked `.capnp` files under the requested path. Captain snapshots the current
-worktree into a temporary directory before checking, excluding `.git` and
-`target`.
+untracked `.capnp` files under the requested path. Captain snapshots only the
+requested path roots and relative import paths into a temporary directory before
+checking, excluding `.git` and `target`.
 
 ## Globs And Imports
 
@@ -98,7 +99,8 @@ captain check \
 ```
 
 In git modes, relative import paths are resolved separately under each temporary
-export or worktree snapshot.
+export or worktree snapshot. Relative import paths are also materialized from the
+selected refs and current worktree.
 
 ## Exit Codes
 
