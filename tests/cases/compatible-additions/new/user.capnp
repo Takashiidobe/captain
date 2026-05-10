@@ -2,7 +2,7 @@
 
 struct User {
   id @0 :UInt64;
-  primaryEmail @1 :Text;
+  email @1 :Text;
   status @2 :Status;
   displayName @3 :Text;
 }

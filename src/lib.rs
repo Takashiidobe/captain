@@ -63,11 +63,18 @@ struct ResolvedCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub violations: Vec<Violation>,
+    pub lints: Vec<Lint>,
 }
 
 impl Report {
     pub fn is_compatible(&self) -> bool {
-        self.violations.is_empty()
+        self.violations.is_empty() && !self.has_error_lints()
+    }
+
+    fn has_error_lints(&self) -> bool {
+        self.lints
+            .iter()
+            .any(|lint| lint.severity == LintSeverity::Error)
     }
 }
 
@@ -79,9 +86,37 @@ pub struct Violation {
     pub after: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lint {
+    pub severity: LintSeverity,
+    pub path: String,
+    pub reason: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintSeverity {
+    Error,
+    Warning,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub nodes: BTreeMap<String, Node>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaSet {
+    pub snapshot: Snapshot,
+    pub files: Vec<SchemaFile>,
+    pub lints: Vec<Lint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaFile {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +138,7 @@ pub enum NodeKind {
 pub struct Field {
     pub name: String,
     pub ty: String,
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +205,13 @@ enum CheckMode {
 fn check_resolved(config: &ResolvedCheck) -> Result<Report, Error> {
     let before_sources = discover_capnp_sources(&config.before)?;
     let after_sources = discover_capnp_sources(&config.after)?;
+    let before = snapshot_sources(&before_sources)?;
+    let after = snapshot_sources(&after_sources)?;
+    let report = compare(&before, &after);
+
+    if report.has_error_lints() {
+        return Ok(report);
+    }
 
     compile_with_capnp(
         &before_sources.files,
@@ -181,10 +224,7 @@ fn check_resolved(config: &ResolvedCheck) -> Result<Report, Error> {
         &config.after_import_paths,
     )?;
 
-    let before = snapshot_files(&before_sources.files)?;
-    let after = snapshot_files(&after_sources.files)?;
-
-    Ok(compare(&before, &after))
+    Ok(report)
 }
 
 fn check_mode(config: &CheckConfig) -> Result<CheckMode, Error> {
@@ -262,11 +302,12 @@ fn check_mode(config: &CheckConfig) -> Result<CheckMode, Error> {
     }))
 }
 
-pub fn compare(before: &Snapshot, after: &Snapshot) -> Report {
+pub fn compare(before: &SchemaSet, after: &SchemaSet) -> Report {
     let mut violations = Vec::new();
+    let mut lints = lint_schema_sets(before, after);
 
-    for (node_name, before_node) in &before.nodes {
-        let Some(after_node) = after.nodes.get(node_name) else {
+    for (node_name, before_node) in &before.snapshot.nodes {
+        let Some(after_node) = after.snapshot.nodes.get(node_name) else {
             violations.push(Violation {
                 path: node_name.clone(),
                 reason: "node was removed".to_owned(),
@@ -286,33 +327,108 @@ pub fn compare(before: &Snapshot, after: &Snapshot) -> Report {
             continue;
         }
 
-        compare_struct_fields(node_name, before_node, after_node, &mut violations);
-        compare_enum_values(node_name, before_node, after_node, &mut violations);
-        compare_methods(node_name, before_node, after_node, &mut violations);
+        compare_struct_fields(
+            node_name,
+            before_node,
+            after_node,
+            &mut violations,
+            &mut lints,
+        );
+        lint_field_default_changes(node_name, before_node, after_node, &mut lints);
+        compare_enum_values(
+            node_name,
+            before_node,
+            after_node,
+            &mut violations,
+            &mut lints,
+        );
+        compare_methods(
+            node_name,
+            before_node,
+            after_node,
+            &mut violations,
+            &mut lints,
+        );
     }
 
-    Report { violations }
+    Report { violations, lints }
 }
 
-pub fn snapshot_files(files: &[PathBuf]) -> Result<Snapshot, Error> {
+fn snapshot_sources(sources: &DiscoveredSources) -> Result<SchemaSet, Error> {
+    let mut set = snapshot_files(&sources.files)?;
+    let root = common_file_root(&sources.files);
+    for file in &sources.duplicate_files {
+        set.lints.push(Lint {
+            severity: LintSeverity::Error,
+            path: relative_schema_path(file, &root),
+            reason: "file was selected more than once".to_owned(),
+            detail: None,
+        });
+    }
+    Ok(set)
+}
+
+pub fn snapshot_files(files: &[PathBuf]) -> Result<SchemaSet, Error> {
     let mut snapshot = Snapshot::default();
+    let mut schema_files = Vec::new();
+    let mut lints = Vec::new();
+    let mut node_paths = BTreeMap::new();
+    let root = common_file_root(files);
 
     for file in files {
         let source = fs::read_to_string(file).map_err(|source| Error::Io {
             path: file.clone(),
             source,
         })?;
-        let file_snapshot = parse_schema(&source);
-        for (name, node) in file_snapshot.nodes {
-            snapshot.nodes.insert(name, node);
+        let file_snapshot = parse_schema_with_lints(&source);
+        for mut lint in file_snapshot.lints {
+            lint.path = format!("{}:{}", relative_schema_path(file, &root), lint.path);
+            lints.push(lint);
+        }
+        schema_files.push(SchemaFile {
+            path: file.clone(),
+            relative_path: relative_schema_path(file, &root),
+            file_id: parse_file_id(&source),
+        });
+        for (name, node) in file_snapshot.snapshot.nodes {
+            if let Some(first_path) = node_paths.get(&name) {
+                lints.push(Lint {
+                    severity: LintSeverity::Error,
+                    path: name,
+                    reason: "node name is defined in multiple files".to_owned(),
+                    detail: Some(format!(
+                        "{} and {}",
+                        first_path,
+                        relative_schema_path(file, &root)
+                    )),
+                });
+            } else {
+                node_paths.insert(name.clone(), relative_schema_path(file, &root));
+                snapshot.nodes.insert(name, node);
+            }
         }
     }
 
-    Ok(snapshot)
+    Ok(SchemaSet {
+        snapshot,
+        files: schema_files,
+        lints,
+    })
 }
 
 pub fn parse_schema(source: &str) -> Snapshot {
+    parse_schema_with_lints(source).snapshot
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedSchema {
+    snapshot: Snapshot,
+    lints: Vec<Lint>,
+}
+
+fn parse_schema_with_lints(source: &str) -> ParsedSchema {
     let mut snapshot = Snapshot::default();
+    let mut lints = Vec::new();
     let mut stack: Vec<(String, NodeKind)> = Vec::new();
 
     for statement in statements(source) {
@@ -327,15 +443,22 @@ pub fn parse_schema(source: &str) -> Snapshot {
             } else {
                 name
             };
-            snapshot.nodes.insert(
-                full_name.clone(),
-                Node {
-                    kind,
-                    fields: BTreeMap::new(),
-                    enum_values: BTreeMap::new(),
-                    methods: BTreeMap::new(),
-                },
-            );
+            let node = Node {
+                kind,
+                fields: BTreeMap::new(),
+                enum_values: BTreeMap::new(),
+                methods: BTreeMap::new(),
+            };
+            if snapshot.nodes.contains_key(&full_name) {
+                lints.push(Lint {
+                    severity: LintSeverity::Error,
+                    path: full_name.clone(),
+                    reason: "node name is defined multiple times".to_owned(),
+                    detail: None,
+                });
+            } else {
+                snapshot.nodes.insert(full_name.clone(), node);
+            }
             stack.push((full_name, kind));
             continue;
         }
@@ -350,29 +473,57 @@ pub fn parse_schema(source: &str) -> Snapshot {
         match kind {
             NodeKind::Struct => {
                 if let Some((ordinal, field)) = parse_field(&statement) {
-                    node.fields.insert(ordinal, field);
+                    if let Some(existing) = node.fields.get(&ordinal) {
+                        lints.push(Lint {
+                            severity: LintSeverity::Error,
+                            path: format!("{node_name}.field[{ordinal}]"),
+                            reason: "field ordinal is defined multiple times".to_owned(),
+                            detail: Some(format!("{} and {}", existing.name, field.name)),
+                        });
+                    } else {
+                        node.fields.insert(ordinal, field);
+                    }
                 }
             }
             NodeKind::Enum => {
                 if let Some((ordinal, value)) = parse_enum_value(&statement) {
-                    node.enum_values.insert(ordinal, value);
+                    if let Some(existing) = node.enum_values.get(&ordinal) {
+                        lints.push(Lint {
+                            severity: LintSeverity::Error,
+                            path: format!("{node_name}.enum[{ordinal}]"),
+                            reason: "enum ordinal is defined multiple times".to_owned(),
+                            detail: Some(format!("{} and {}", existing.name, value.name)),
+                        });
+                    } else {
+                        node.enum_values.insert(ordinal, value);
+                    }
                 }
             }
             NodeKind::Interface => {
                 if let Some((ordinal, method)) = parse_method(&statement) {
-                    node.methods.insert(ordinal, method);
+                    if let Some(existing) = node.methods.get(&ordinal) {
+                        lints.push(Lint {
+                            severity: LintSeverity::Error,
+                            path: format!("{node_name}.method[{ordinal}]"),
+                            reason: "method ordinal is defined multiple times".to_owned(),
+                            detail: Some(format!("{} and {}", existing.name, method.name)),
+                        });
+                    } else {
+                        node.methods.insert(ordinal, method);
+                    }
                 }
             }
         }
     }
 
-    snapshot
+    ParsedSchema { snapshot, lints }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredSources {
     pub files: Vec<PathBuf>,
     pub import_roots: Vec<PathBuf>,
+    pub duplicate_files: Vec<PathBuf>,
 }
 
 pub fn discover_capnp_sources(sources: &[String]) -> Result<DiscoveredSources, Error> {
@@ -392,6 +543,7 @@ pub fn discover_capnp_sources(sources: &[String]) -> Result<DiscoveredSources, E
     }
 
     files.sort();
+    let duplicate_files = duplicate_paths(&files);
     files.dedup();
 
     if files.is_empty() {
@@ -402,12 +554,27 @@ pub fn discover_capnp_sources(sources: &[String]) -> Result<DiscoveredSources, E
         Ok(DiscoveredSources {
             files,
             import_roots,
+            duplicate_files,
         })
     }
 }
 
 pub fn discover_capnp_files(root: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(discover_capnp_sources(&[root.display().to_string()])?.files)
+}
+
+fn duplicate_paths(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut duplicates = Vec::new();
+    let mut previous = None;
+
+    for file in files {
+        if previous.is_some_and(|previous| previous == file) {
+            duplicates.push(file.clone());
+        }
+        previous = Some(file);
+    }
+
+    duplicates
 }
 
 fn discover_path(
@@ -979,11 +1146,161 @@ fn prefix_string_path(root: &Path, path: &str) -> String {
     }
 }
 
+fn lint_schema_sets(before: &SchemaSet, after: &SchemaSet) -> Vec<Lint> {
+    let mut lints = Vec::new();
+    lints.extend(before.lints.clone());
+    lints.extend(after.lints.clone());
+    lint_file_ids("before", &before.files, &mut lints);
+    lint_file_ids("after", &after.files, &mut lints);
+    lint_file_id_changes(before, after, &mut lints);
+    lints
+}
+
+fn lint_file_ids(side: &str, files: &[SchemaFile], lints: &mut Vec<Lint>) {
+    let mut by_id: BTreeMap<&str, Vec<&SchemaFile>> = BTreeMap::new();
+
+    for file in files {
+        let path = format!("{side}:{}", file.relative_path);
+        let Some(file_id) = &file.file_id else {
+            lints.push(Lint {
+                severity: LintSeverity::Error,
+                path,
+                reason: "file is missing a file id".to_owned(),
+                detail: None,
+            });
+            continue;
+        };
+        by_id.entry(file_id).or_default().push(file);
+    }
+
+    for (file_id, duplicates) in by_id {
+        if duplicates.len() < 2 {
+            continue;
+        }
+        lints.push(Lint {
+            severity: LintSeverity::Error,
+            path: format!("{side}:{file_id}"),
+            reason: "file id is used by multiple files".to_owned(),
+            detail: Some(
+                duplicates
+                    .into_iter()
+                    .map(|file| file.relative_path.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        });
+    }
+}
+
+fn lint_file_id_changes(before: &SchemaSet, after: &SchemaSet, lints: &mut Vec<Lint>) {
+    let before_by_path = before
+        .files
+        .iter()
+        .map(|file| (file.relative_path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+
+    for after_file in &after.files {
+        let Some(before_file) = before_by_path.get(after_file.relative_path.as_str()) else {
+            continue;
+        };
+        let (Some(before_id), Some(after_id)) = (&before_file.file_id, &after_file.file_id) else {
+            continue;
+        };
+        if before_id == after_id {
+            continue;
+        }
+        lints.push(Lint {
+            severity: LintSeverity::Error,
+            path: after_file.relative_path.clone(),
+            reason: "file id changed".to_owned(),
+            detail: Some(format!("{before_id} -> {after_id}")),
+        });
+    }
+}
+
+fn lint_field_default_changes(
+    node_name: &str,
+    before_node: &Node,
+    after_node: &Node,
+    lints: &mut Vec<Lint>,
+) {
+    if before_node.kind != NodeKind::Struct {
+        return;
+    }
+
+    for (ordinal, before_field) in &before_node.fields {
+        let Some(after_field) = after_node.fields.get(ordinal) else {
+            continue;
+        };
+        if normalize_type(&before_field.ty) != normalize_type(&after_field.ty) {
+            continue;
+        }
+        if normalize_default(before_field.default.as_deref())
+            == normalize_default(after_field.default.as_deref())
+        {
+            continue;
+        }
+        lints.push(Lint {
+            severity: LintSeverity::Error,
+            path: format!("{node_name}.field[{ordinal}]"),
+            reason: "field default value changed".to_owned(),
+            detail: Some(format!(
+                "{} -> {}",
+                before_field.default.as_deref().unwrap_or("<none>"),
+                after_field.default.as_deref().unwrap_or("<none>")
+            )),
+        });
+    }
+}
+
+fn parse_file_id(source: &str) -> Option<String> {
+    statements(source)
+        .into_iter()
+        .find_map(|statement| parse_file_id_statement(&statement))
+}
+
+fn parse_file_id_statement(statement: &str) -> Option<String> {
+    let statement = statement.trim().trim_end_matches(';').trim();
+    let id = statement.strip_prefix('@')?;
+    let hex = id.strip_prefix("0x")?;
+    if hex.len() != 16 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("@0x{}", hex.to_ascii_lowercase()))
+}
+
+fn common_file_root(files: &[PathBuf]) -> PathBuf {
+    let mut parents = files
+        .iter()
+        .filter_map(|file| file.parent().map(Path::to_path_buf));
+    let Some(mut root) = parents.next() else {
+        return PathBuf::new();
+    };
+
+    for parent in parents {
+        while !parent.starts_with(&root) {
+            if !root.pop() {
+                return PathBuf::new();
+            }
+        }
+    }
+
+    root
+}
+
+fn relative_schema_path(file: &Path, root: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn compare_struct_fields(
     node_name: &str,
     before_node: &Node,
     after_node: &Node,
     violations: &mut Vec<Violation>,
+    lints: &mut Vec<Lint>,
 ) {
     if before_node.kind != NodeKind::Struct {
         return;
@@ -1008,6 +1325,13 @@ fn compare_struct_fields(
                 before: Some(format!("{}: {}", before_field.name, before_field.ty)),
                 after: Some(format!("{}: {}", after_field.name, after_field.ty)),
             });
+        } else if before_field.name != after_field.name {
+            lints.push(Lint {
+                severity: LintSeverity::Error,
+                path,
+                reason: "field name changed".to_owned(),
+                detail: Some(format!("{} -> {}", before_field.name, after_field.name)),
+            });
         }
     }
 }
@@ -1017,6 +1341,7 @@ fn compare_enum_values(
     before_node: &Node,
     after_node: &Node,
     violations: &mut Vec<Violation>,
+    lints: &mut Vec<Lint>,
 ) {
     if before_node.kind != NodeKind::Enum {
         return;
@@ -1035,11 +1360,11 @@ fn compare_enum_values(
         };
 
         if before_value.name != after_value.name {
-            violations.push(Violation {
+            lints.push(Lint {
+                severity: LintSeverity::Error,
                 path,
-                reason: "enum ordinal was reused with a different name".to_owned(),
-                before: Some(before_value.name.clone()),
-                after: Some(after_value.name.clone()),
+                reason: "enum value name changed".to_owned(),
+                detail: Some(format!("{} -> {}", before_value.name, after_value.name)),
             });
         }
     }
@@ -1050,6 +1375,7 @@ fn compare_methods(
     before_node: &Node,
     after_node: &Node,
     violations: &mut Vec<Violation>,
+    lints: &mut Vec<Lint>,
 ) {
     if before_node.kind != NodeKind::Interface {
         return;
@@ -1081,6 +1407,13 @@ fn compare_methods(
                     before_method.name, before_method.signature
                 )),
                 after: Some(format!("{} {}", after_method.name, after_method.signature)),
+            });
+        } else if before_method.name != after_method.name {
+            lints.push(Lint {
+                severity: LintSeverity::Error,
+                path,
+                reason: "method name changed".to_owned(),
+                detail: Some(format!("{} -> {}", before_method.name, after_method.name)),
             });
         }
     }
@@ -1174,13 +1507,8 @@ fn parse_field(statement: &str) -> Option<(u32, Field)> {
     }
 
     let ordinal = parse_ordinal(&statement[at + 1..colon])?;
-    let ty = statement[colon + 1..]
-        .trim()
-        .trim_end_matches(';')
-        .split('=')
-        .next()?
-        .trim()
-        .to_owned();
+    let value = statement[colon + 1..].trim().trim_end_matches(';').trim();
+    let (ty, default) = parse_field_type_and_default(value)?;
 
     if ty.is_empty() {
         None
@@ -1190,9 +1518,21 @@ fn parse_field(statement: &str) -> Option<(u32, Field)> {
             Field {
                 name: name.to_owned(),
                 ty,
+                default,
             },
         ))
     }
+}
+
+fn parse_field_type_and_default(value: &str) -> Option<(String, Option<String>)> {
+    let mut parts = value.splitn(2, '=');
+    let ty = parts.next()?.trim().to_owned();
+    let default = parts
+        .next()
+        .map(str::trim)
+        .filter(|default| !default.is_empty())
+        .map(str::to_owned);
+    Some((ty, default))
 }
 
 fn parse_enum_value(statement: &str) -> Option<(u32, EnumValue)> {
@@ -1244,8 +1584,12 @@ fn normalize_signature(signature: &str) -> String {
     signature.split_whitespace().collect::<String>()
 }
 
+fn normalize_default(default: Option<&str>) -> Option<String> {
+    default.map(|value| value.split_whitespace().collect::<String>())
+}
+
 pub fn format_report(report: &Report) -> String {
-    if report.is_compatible() {
+    if report.violations.is_empty() && report.lints.is_empty() {
         return "compatible: no backwards-incompatible schema changes found".to_owned();
     }
 
@@ -1260,7 +1604,24 @@ pub fn format_report(report: &Report) -> String {
             output.push_str(&format!("  after: {after}\n"));
         }
     }
+    for lint in &report.lints {
+        output.push_str(&format!("lint: {}\n", lint.path));
+        output.push_str(&format!("  severity: {}\n", lint.severity.as_str()));
+        output.push_str(&format!("  reason: {}\n", lint.reason));
+        if let Some(detail) = &lint.detail {
+            output.push_str(&format!("  detail: {detail}\n"));
+        }
+    }
     output.trim_end().to_owned()
+}
+
+impl LintSeverity {
+    fn as_str(self) -> &'static str {
+        match self {
+            LintSeverity::Error => "error",
+            LintSeverity::Warning => "warning",
+        }
+    }
 }
 
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CheckConfig, Error> {
@@ -1419,5 +1780,364 @@ mod tests {
         );
 
         assert_eq!(roots, vec![PathBuf::from("schemas")]);
+    }
+
+    #[test]
+    fn lints_missing_file_ids_before_compile() {
+        let before = SchemaSet {
+            snapshot: Snapshot::default(),
+            files: vec![SchemaFile {
+                path: PathBuf::from("old/user.capnp"),
+                relative_path: "user.capnp".to_owned(),
+                file_id: Some("@0xbf5147cbbecf40c1".to_owned()),
+            }],
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: Snapshot::default(),
+            files: vec![SchemaFile {
+                path: PathBuf::from("new/user.capnp"),
+                relative_path: "user.capnp".to_owned(),
+                file_id: None,
+            }],
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: after:user.capnp\n",
+                "  severity: error\n",
+                "  reason: file is missing a file id"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_duplicate_file_ids() {
+        let before = SchemaSet::default();
+        let after = SchemaSet {
+            snapshot: Snapshot::default(),
+            files: vec![
+                SchemaFile {
+                    path: PathBuf::from("new/payment.capnp"),
+                    relative_path: "payment.capnp".to_owned(),
+                    file_id: Some("@0xbf5147cbbecf40c1".to_owned()),
+                },
+                SchemaFile {
+                    path: PathBuf::from("new/user.capnp"),
+                    relative_path: "user.capnp".to_owned(),
+                    file_id: Some("@0xbf5147cbbecf40c1".to_owned()),
+                },
+            ],
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: after:@0xbf5147cbbecf40c1\n",
+                "  severity: error\n",
+                "  reason: file id is used by multiple files\n",
+                "  detail: payment.capnp, user.capnp"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_file_id_changes_for_same_relative_path() {
+        let before = SchemaSet {
+            snapshot: Snapshot::default(),
+            files: vec![SchemaFile {
+                path: PathBuf::from("old/user.capnp"),
+                relative_path: "user.capnp".to_owned(),
+                file_id: Some("@0xbf5147cbbecf40c1".to_owned()),
+            }],
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: Snapshot::default(),
+            files: vec![SchemaFile {
+                path: PathBuf::from("new/user.capnp"),
+                relative_path: "user.capnp".to_owned(),
+                file_id: Some("@0xaf5147cbbecf40c1".to_owned()),
+            }],
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: user.capnp\n",
+                "  severity: error\n",
+                "  reason: file id changed\n",
+                "  detail: @0xbf5147cbbecf40c1 -> @0xaf5147cbbecf40c1"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_duplicate_node_names_without_overwriting_first_node() {
+        let root = test_temp_dir("duplicate-node-name");
+        let first = root.join("a.capnp");
+        let second = root.join("b.capnp");
+        fs::write(
+            &first,
+            concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  id @0 :UInt64;\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            concat!(
+                "@0xaf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  email @0 :Text;\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+
+        let set = snapshot_files(&[first, second]).unwrap();
+
+        assert_eq!(set.snapshot.nodes["User"].fields[&0].name, "id");
+        assert_eq!(
+            set.lints,
+            vec![Lint {
+                severity: LintSeverity::Error,
+                path: "User".to_owned(),
+                reason: "node name is defined in multiple files".to_owned(),
+                detail: Some("a.capnp and b.capnp".to_owned()),
+            }]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lints_duplicate_discovered_files() {
+        let root = test_temp_dir("duplicate-discovered-file");
+        let file = root.join("user.capnp");
+        fs::write(
+            &file,
+            concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  id @0 :UInt64;\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+
+        let sources =
+            discover_capnp_sources(&[file.display().to_string(), file.display().to_string()])
+                .unwrap();
+        let set = snapshot_sources(&sources).unwrap();
+
+        assert_eq!(
+            set.lints,
+            vec![Lint {
+                severity: LintSeverity::Error,
+                path: "user.capnp".to_owned(),
+                reason: "file was selected more than once".to_owned(),
+                detail: None,
+            }]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lints_parser_collisions_without_overwriting_first_field() {
+        let root = test_temp_dir("parser-collision");
+        let file = root.join("user.capnp");
+        fs::write(
+            &file,
+            concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  id @0 :UInt64;\n",
+                "  email @0 :Text;\n",
+                "}\n"
+            ),
+        )
+        .unwrap();
+
+        let set = snapshot_files(&[file]).unwrap();
+
+        assert_eq!(set.snapshot.nodes["User"].fields[&0].name, "id");
+        assert_eq!(
+            set.lints,
+            vec![Lint {
+                severity: LintSeverity::Error,
+                path: "user.capnp:User.field[0]".to_owned(),
+                reason: "field ordinal is defined multiple times".to_owned(),
+                detail: Some("id and email".to_owned()),
+            }]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lints_field_default_value_changes() {
+        let before = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  active @0 :Bool = true;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  active @0 :Bool = false;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: User.field[0]\n",
+                "  severity: error\n",
+                "  reason: field default value changed\n",
+                "  detail: true -> false"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_field_name_changes() {
+        let before = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  email @0 :Text;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "struct User {\n",
+                "  primaryEmail @0 :Text;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: User.field[0]\n",
+                "  severity: error\n",
+                "  reason: field name changed\n",
+                "  detail: email -> primaryEmail"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_enum_value_name_changes() {
+        let before = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "enum Status {\n",
+                "  active @0;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "enum Status {\n",
+                "  enabled @0;\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: Status.enum[0]\n",
+                "  severity: error\n",
+                "  reason: enum value name changed\n",
+                "  detail: active -> enabled"
+            )
+        );
+    }
+
+    #[test]
+    fn lints_method_name_changes() {
+        let before = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "interface Users {\n",
+                "  get @0 (id :UInt64) -> (email :Text);\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+        let after = SchemaSet {
+            snapshot: parse_schema(concat!(
+                "@0xbf5147cbbecf40c1;\n",
+                "interface Users {\n",
+                "  fetch @0 (id :UInt64) -> (email :Text);\n",
+                "}\n"
+            )),
+            files: Vec::new(),
+            lints: Vec::new(),
+        };
+
+        let report = compare(&before, &after);
+
+        assert_eq!(
+            format_report(&report),
+            concat!(
+                "lint: Users.method[0]\n",
+                "  severity: error\n",
+                "  reason: method name changed\n",
+                "  detail: get -> fetch"
+            )
+        );
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("captain-{name}-{nanos}"));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 }
